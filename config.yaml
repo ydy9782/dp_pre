@@ -1,0 +1,178 @@
+# Audio Dual-Branch Pretrain Model Configuration
+# 音频双分支预训练模型配置文件
+
+# ══════════════════════════════════════════════════════════════
+#  数据配置
+#  source_mode 控制数据加载方式，三选一：
+#
+#  "simple"   → 递归扫描 data_dir 目录（原始行为）
+#
+#  "dcase"    → 按 DCASE2025 目录结构自动发现机器类型
+#               目录结构：<dcase_root>/<machine_type>/<split>/
+#               machine_types 留空 [] 则加载全部机器类型
+#
+#  "explicit" → 手动列出要扫描的目录（最灵活）
+# ══════════════════════════════════════════════════════════════
+data:
+  # ── 通用参数（三种模式均需要）────────────────
+  sample_rate: 16000
+  audio_length: 2.0           # 合成音频时长(秒)；真实音频不受此限制
+  n_mels: 80
+  n_fft: 1024
+  hop_length: 256
+  win_length: 1024
+  fmin: 0
+  fmax: 8000
+  train_split: 0.8            # 训练/验证划分比例
+  max_audio_seconds: 6.0      # 16GB 显卡更稳妥；需要更长上下文时再逐步上调
+
+  # ── 模式选择：改这一行来切换模式 ────────────
+  source_mode: dcase          # 可选: simple | dcase | explicit
+
+  # ── 模式 1: simple ──────────────────────────
+  # 递归扫描 data_dir 下所有音频文件
+  data_dir: "./data"
+
+  # ── 模式 2: dcase ───────────────────────────
+  # 目录结构：<dcase_root>/<machine_type>/<split>/
+  dcase_root: "./data/dcase2025t2/eval_data/raw"
+  machine_types:              # 留空 [] 自动加载全部机器类型
+    - AutoTrash
+    # - fan
+    # - pump
+    # - slider
+    # - ToyCar
+  split: train                # 子目录名：train / test / val
+
+  # ── 模式 3: explicit ────────────────────────
+  # 手动列出每个要扫描的目录（支持跨数据集混合）
+  data_paths:
+    - "./data/dcase2025t2/eval_data/raw/AutoTrash/train"
+    # - "./data/dcase2025t2/eval_data/raw/fan/train"
+    # - "./data/other_dataset/audio"
+
+# 掩码配置
+# mask_type 可选：block（默认推荐）| circular | random | single | structured
+#
+# block（默认推荐）：
+#   单个连续块，大小 = length × mask_ratio。
+#   相比 circular 30% 这种超长跨边界掩码，更接近可学习的音频补全难度。
+#
+# circular：
+#   将频谱图时间轴首尾相连成环，随机起点，连续掩码 mask_ratio 比例的帧。
+#   起点可落在任意位置，超出末尾自动从头环绕，保证掩码永远连续且比例精确。
+#   只需调 mask_ratio，其余参数对该模式不生效。
+#
+# 其他模式说明（保留兼容）：
+#   random     : 随机散布多个长度为 mask_length 的 block
+#   single     : 单个连续块，大小 = mask_length 帧（固定帧数）
+#   structured : 均匀间隔分布多个 mask block
+mask:
+  mask_type: "block"          # 默认先学习稳定的连续补全；需要更难任务再切换 circular
+  mask_ratio: 0.1             # circular/block/random 生效：掩码占比（0~1）
+  mask_length: 20             # single/random/structured 生效：每个 block 的帧数
+  min_masks: 1                # random/structured 生效：最少 block 数
+  max_masks: 10               # random/structured 生效：最多 block 数
+
+# 模型配置
+model:
+  transformer:
+    input_dim: 128
+    hidden_dim: 256
+    num_heads: 4
+    num_layers: 4
+    dropout: 0.1
+    max_seq_len: 2048
+    patch_stride: 256        # 与 hop_length 对齐，显著缩短波形 token 序列
+    patch_kernel: 1024       # 与 STFT 分析窗对齐，保留局部上下文
+    patch_padding: 512
+
+  cnn:
+    in_channels: 1
+    base_channels: 32
+    num_layers: 4
+    kernel_size: 3
+    stride: 2
+    time_strides: [1, 2, 1, 2]   # 频谱时间轴下采样计划，总时间下采样倍率=4
+    padding: 1
+    freq_bins: 4             # 编码端保留的频率子带数量，避免过早压成单条频率轴
+    dropout: 0.1
+
+  fusion:
+    hidden_dim: 256
+    output_dim: 256
+    num_heads: 4
+    dropout: 0.1
+    ffn_multiplier: 4
+
+  decoder:
+    waveform_hidden_dim: 256
+    waveform_num_layers: 6
+    waveform_num_heads: 8
+    waveform_patch_mlp_ratio: 2
+    waveform_refine_channels: 16
+    waveform_refine_kernel_size: 5
+    waveform_refine_residual_scale: 0.25
+    mask_feature_bias_scale: 0.25
+    spectrogram_hidden_dim: 256
+    spectrogram_num_layers: 4
+    spectrogram_num_heads: 8
+    spectrogram_refine_channels: [32, 16]
+    spectrogram_refine_kernel_size: 3
+    dropout: 0.1
+
+# 训练配置
+training:
+  batch_size: 2               # DataLoader batch 大小；实际显存占用由 micro_batch_size 决定
+  micro_batch_size: 1         # 单次上 GPU 的样本数，16GB 显卡建议从 1 开始
+  num_epochs: 100
+  learning_rate: 0.0001
+  weight_decay: 0.01
+  warmup_steps: 500
+  grad_clip: 1.0
+  use_amp: true
+  amp_dtype: float16
+  save_interval: 10
+  log_interval: 50
+  checkpoint_dir: "./checkpoints"
+
+  loss_weights:
+    waveform: 0.7
+    spectrogram: 0.3
+  waveform_mask_loss_weight: 0.5
+  waveform_mask_l1_weight: 0.25
+  spectrogram_mask_loss_weight: 10.0
+  spectrogram_mask_l1_weight: 2.0
+  unmask_loss_weight: 0.0
+  waveform_unmask_loss_weight: 0.5
+  spectrogram_unmask_loss_weight: 1.0
+  copy_unmasked_input: false
+  waveform_stft_loss_weight: 2.0
+  waveform_diff_loss_weight: 1.0
+  waveform_coarse_loss_weight: 0.5
+  waveform_coarse_l1_weight: 0.25
+  waveform_mel_loss_weight: 4.0
+  waveform_mel_mask_margin_frames: 4
+  waveform_mel_chunk_size: 16
+  waveform_stft_resolutions:
+    - n_fft: 256
+      hop_length: 64
+      win_length: 256
+    - n_fft: 512
+      hop_length: 128
+      win_length: 512
+    - n_fft: 1024
+      hop_length: 256
+      win_length: 1024
+
+# 可视化配置
+visualization:
+  output_dir: "./visualizations"
+  num_samples: 5
+  save_audio: true
+  dpi: 150
+
+# 设备配置
+device: "cuda"
+seed: 42
+num_workers: 4
